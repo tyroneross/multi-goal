@@ -27,9 +27,13 @@ from pathlib import Path
 
 try:
     import numpy as np
-except ImportError:
-    sys.stderr.write("test_doe.py requires numpy; skipping\n")
-    sys.exit(0)
+except ImportError:  # pragma: no cover - numpy is a declared dependency
+    # Never call sys.exit() at module scope: pytest imports test modules inside
+    # its collection hook, where a SystemExit escapes as INTERNALERROR and
+    # aborts the WHOLE session ("no tests ran") instead of skipping one module.
+    import pytest
+
+    pytest.skip("test_doe.py requires numpy", allow_module_level=True)
 
 # Robust import of doe.py from scripts/
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
