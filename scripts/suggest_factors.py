@@ -75,6 +75,32 @@ ENV_PROCESS_ENV = re.compile(
 
 NUM_LITERAL = re.compile(r"\b(\d+(?:\.\d+)?)\b")
 
+# Pattern 4: numeric fields inside an exported object literal / dict constant.
+#   export const SEARCH_THRESHOLDS = { GROQ_SCORE_WEIGHT: 0.7, ... }
+#   SEARCH_THRESHOLDS = { "min_score": 0.3, ... }        (Python)
+# The real tuning surface of an app often lives here, not in top-level
+# constants, and a scanner that cannot see it ranks PORT above the knob that
+# matters. Fields are reported as OBJECT.KEY so the definition site is unique.
+OBJ_LITERAL_OPEN = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)?\s*([A-Z][A-Z0-9_]{2,})\s*(?::\s*[^=]+?)?\s*=\s*\{\s*$"
+)
+PY_OBJ_LITERAL_OPEN = re.compile(r"^\s*([A-Z][A-Z0-9_]{2,})\s*(?::\s*[^=]+?)?\s*=\s*\{\s*$")
+OBJ_LITERAL_FIELD = re.compile(
+    r"""^\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*:\s*(-?\d+(?:\.\d+)?)\s*,?\s*(?://.*|#.*)?$"""
+)
+OBJ_LITERAL_CLOSE = re.compile(r"^\s*\}")
+
+HINT_STOPWORDS = {"the", "and", "for", "with", "make", "faster", "improve", "optimize",
+                  "reduce", "increase", "better", "more", "less", "time", "page"}
+
+
+def hint_tokens(hint: str | None) -> set[str]:
+    """Lower-case keyword set from an objective hint ("search latency" -> {search, latency})."""
+    if not hint:
+        return set()
+    toks = {t for t in re.split(r"[^a-z0-9]+", hint.lower()) if len(t) >= 3}
+    return toks - HINT_STOPWORDS
+
 
 @dataclass
 class Candidate:
@@ -86,6 +112,7 @@ class Candidate:
     why: str
     references: int = 0
     suggested_levels: list = field(default_factory=list)
+    hint_matches: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +165,35 @@ def scan_file(path: Path) -> list[Candidate]:
         return candidates
 
     lines = text.splitlines()
+    obj_name: str | None = None
     for lineno, line in enumerate(lines, start=1):
         # Skip comments
         stripped = line.strip()
         if stripped.startswith("#") or stripped.startswith("//"):
+            continue
+
+        # Pattern 4: fields of an object-literal constant (tracked by block)
+        if obj_name is not None:
+            if OBJ_LITERAL_CLOSE.match(line):
+                obj_name = None
+            else:
+                mf = OBJ_LITERAL_FIELD.match(line)
+                if mf:
+                    key, val = mf.group(1), float(mf.group(2))
+                    key_lower = key.lower()
+                    kw_match = next((k for k in TUNING_KEYWORDS if k in key_lower), None)
+                    confidence = "high" if kw_match else "medium"
+                    why = (f"field of object constant {obj_name}"
+                           + (f" + '{kw_match}' keyword" if kw_match else ""))
+                    candidates.append(Candidate(
+                        name=f"{obj_name}.{key}", file=str(path), line=lineno,
+                        current_value=val, confidence=confidence, why=why,
+                    ))
+                continue
+        mo = (PY_OBJ_LITERAL_OPEN.match(line) if path.suffix == ".py"
+              else OBJ_LITERAL_OPEN.match(line))
+        if mo:
+            obj_name = mo.group(1)
             continue
 
         # Pattern 1: UPPER_SNAKE_CASE = N  (Python or JS/TS-ish)
@@ -179,7 +231,9 @@ def scan_file(path: Path) -> list[Candidate]:
     return candidates
 
 
-def walk_repo(root: Path) -> list[Candidate]:
+def walk_repo(root: Path, paths: list[str] | None = None) -> list[Candidate]:
+    """Scan every source file under `root`; `paths` restricts the walk to files
+    matching any of the given globs (relative to root, e.g. "lib/search/**")."""
     candidates: list[Candidate] = []
     for path in root.rglob("*"):
         if not path.is_file():
@@ -188,6 +242,11 @@ def walk_repo(root: Path) -> list[Candidate]:
             continue
         if path.suffix not in EXTS:
             continue
+        if paths:
+            rel = path.relative_to(root)
+            if not any(rel.match(g) or rel.as_posix().startswith(g.rstrip("*/"))
+                       for g in paths):
+                continue
         candidates.extend(scan_file(path))
     return candidates
 
@@ -210,10 +269,34 @@ def deduplicate_and_count(candidates: list[Candidate]) -> list[Candidate]:
     return out
 
 
-def rank_candidates(candidates: list[Candidate], top_n: int) -> list[Candidate]:
-    """Sort by confidence x references; return top_n."""
+def hint_score(candidate: Candidate, tokens: set[str], root: Path | None = None) -> int:
+    """How many hint keywords the candidate's name or file path carries."""
+    if not tokens:
+        return 0
+    hay = candidate.name.lower()
+    file_part = candidate.file
+    if root is not None:
+        try:
+            file_part = str(Path(candidate.file).relative_to(root))
+        except ValueError:
+            pass
+    hay += " " + file_part.lower()
+    return sum(1 for t in tokens if t in hay)
+
+
+def rank_candidates(candidates: list[Candidate], top_n: int,
+                    hint: str | None = None, root: Path | None = None) -> list[Candidate]:
+    """Sort by confidence x references, boosted by objective-hint matches; return top_n.
+
+    A hint match is worth more than a confidence grade: a "medium" knob in
+    lib/search/ beats a "high" PORT constant when the goal is search latency.
+    """
     confidence_score = {"high": 3, "medium": 2, "low": 1}
-    candidates.sort(key=lambda c: -(confidence_score[c.confidence] * 10 + c.references))
+    tokens = hint_tokens(hint)
+    for c in candidates:
+        c.hint_matches = hint_score(c, tokens, root)
+    candidates.sort(key=lambda c: -(c.hint_matches * 100
+                                    + confidence_score[c.confidence] * 10 + c.references))
     return candidates[:top_n]
 
 
@@ -238,6 +321,12 @@ def main(argv: list[str] | None = None) -> int:
              "orchestrator decides whether to invoke the research capability based "
              "on user confirmation. Off by default.",
     )
+    p.add_argument("--hint", default=None,
+                   help="objective text (e.g. 'search latency'); candidates whose name or "
+                        "path carry its keywords rank first")
+    p.add_argument("--paths", default=None,
+                   help="comma-separated globs relative to workdir restricting the scan "
+                        "(e.g. 'lib/search/**,app/api/search/**')")
     args = p.parse_args(argv)
 
     root = Path(args.workdir).resolve()
@@ -245,12 +334,13 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"not a directory: {root}\n")
         return 2
 
-    candidates = walk_repo(root)
+    path_globs = [g.strip() for g in args.paths.split(",") if g.strip()] if args.paths else None
+    candidates = walk_repo(root, path_globs)
     candidates = deduplicate_and_count(candidates)
     confidence_order = {"high": 3, "medium": 2, "low": 1}
     min_score = confidence_order[args.min_confidence]
     candidates = [c for c in candidates if confidence_order[c.confidence] >= min_score]
-    candidates = rank_candidates(candidates, args.top)
+    candidates = rank_candidates(candidates, args.top, hint=args.hint, root=root)
 
     if args.json:
         rows = [asdict(c) for c in candidates]
