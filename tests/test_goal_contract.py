@@ -352,5 +352,87 @@ class ConfirmCliTests(unittest.TestCase):
             self.assertIn("feasible_run_ids", out["selection"])
 
 
+class ResolutionTests(unittest.TestCase):
+    """D9 from the Atomize dogfood: a guardrail that read 0.67 in every run
+    certified a change that cut the relevance signal beneath it by 65%."""
+
+    def test_zero_range_guardrail_blocks_done(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            r = subprocess.run(
+                [sys.executable, str(SCRIPT), "generate", "--factors",
+                 json.dumps([{"name": "a", "low": 1, "high": 3}, {"name": "b", "low": 10, "high": 20}]),
+                 "--design", "full", "--seed", "1"], capture_output=True, text=True, timeout=20)
+            (tmp / "d.json").write_text(r.stdout)
+            design = json.loads(r.stdout)
+            rng = random.Random(5)
+            with (tmp / "r.jsonl").open("w") as f:
+                for i, (a, b) in enumerate(design["matrix"]):
+                    for _ in range(2):
+                        f.write(json.dumps({"run_id": i, "values": {
+                            "lat": 100 - 20 * a + rng.gauss(0, 1.0), "acc": 0.67}}) + "\n")
+            (tmp / "o.json").write_text(json.dumps({"objectives": [
+                {"name": "lat", "direction": "lower", "role": "primary", "driver": "d",
+                 "target": 85},
+                {"name": "acc", "direction": "higher", "role": "guardrail", "min_acceptable": 0.67}]}))
+            (tmp / "c.jsonl").write_text("\n".join(
+                json.dumps({"values": {"lat": 80 + d, "acc": 0.67}}) for d in (-1, 0, 1, 0.5, -0.5)))
+            r2 = subprocess.run(
+                [sys.executable, str(SCRIPT), "analyze", "--design", str(tmp / "d.json"),
+                 "--results", str(tmp / "r.jsonl"), "--objectives", str(tmp / "o.json")],
+                capture_output=True, text=True, timeout=30)
+            out = json.loads(r2.stdout)
+            self.assertEqual(out["per_objective"]["acc"]["resolution"], "none")
+            self.assertTrue(any("no resolution" in w for w in out["per_objective"]["acc"]["warnings"]))
+            r3 = subprocess.run(
+                [sys.executable, str(SCRIPT), "confirm", "--design", str(tmp / "d.json"),
+                 "--results", str(tmp / "r.jsonl"), "--objectives", str(tmp / "o.json"),
+                 "--confirmation", str(tmp / "c.jsonl")], capture_output=True, text=True, timeout=30)
+            c = json.loads(r3.stdout)
+            self.assertFalse(c["done"])
+            self.assertEqual(c["recommendation"], "improve_guardrail_resolution")
+            self.assertEqual(c["unresolved_guardrails"], ["acc"])
+
+    def test_categorical_factors_do_not_get_center_point_advice(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            r = subprocess.run(
+                [sys.executable, str(SCRIPT), "generate", "--factors",
+                 json.dumps([{"name": "match", "low": "ilike", "high": "fts"},
+                             {"name": "facets", "low": "always", "high": "on_demand"}]),
+                 "--design", "full", "--seed", "1"], capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            (tmp / "d.json").write_text(r.stdout)
+            design = json.loads(r.stdout)
+            with (tmp / "r.jsonl").open("w") as f:
+                for i, (a, b) in enumerate(design["matrix"]):
+                    f.write(json.dumps({"run_id": i, "value": 100 - 10 * a + 2 * b}) + "\n")
+            r2 = subprocess.run(
+                [sys.executable, str(SCRIPT), "analyze", "--design", str(tmp / "d.json"),
+                 "--results", str(tmp / "r.jsonl")], capture_output=True, text=True, timeout=30)
+            out = json.loads(r2.stdout)
+            rep = next(s for s in out["next_step"] if s["action"] == "add_replicates")
+            self.assertNotIn("center-point", rep["reason"])
+            self.assertIn("repeat their run_id", rep["reason"])
+
+
+class CategoricalValidateTests(unittest.TestCase):
+    def test_validate_factors_reports_categorical_instead_of_crashing(self):
+        script = SCRIPTS_DIR / "validate_factors.py"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "x.ts").write_text("export const MODE = 'always';\n")
+            cand = root / "c.json"
+            cand.write_text(json.dumps([{"name": "feed_facets", "current_value": "always",
+                                         "levels": ["always", "on_demand"]}]))
+            r = subprocess.run([sys.executable, str(script), "--workdir", str(root),
+                                "--candidates", str(cand), "--json"],
+                               capture_output=True, text=True, timeout=20)
+            self.assertNotIn("Traceback", r.stderr)
+            rows = json.loads(r.stdout)
+            self.assertEqual(rows[0]["adjustability"], "not_probed")
+            self.assertEqual(rows[0]["reason"], "categorical_level")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

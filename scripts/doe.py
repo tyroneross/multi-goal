@@ -609,6 +609,25 @@ def rank_findings(effects: dict, factor_names: list[str],
 # Practical significance, next step, prediction, confirmation
 # ---------------------------------------------------------------------------
 
+def _has_categorical(design_data: dict) -> bool:
+    """True when any factor carries non-numeric levels (no center point exists)."""
+    for f in design_data.get("factors", []):
+        vals = f["levels"] if "levels" in f else [f.get("low"), f.get("high")]
+        for v in vals:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                try:
+                    float(v)
+                except (TypeError, ValueError):
+                    return True
+    return False
+
+
+def _no_resolution(values) -> bool:
+    """An objective whose observed range is zero across the whole design."""
+    arr = np.asarray(values, dtype=float)
+    return bool(arr.size > 0 and float(arr.max() - arr.min()) == 0.0)
+
+
 NEXT_STEP_PRIORITY = {"decouple": 0, "add_replicates": 1, "confirm": 2,
                       "extend_range": 3, "stop_or_widen": 4}
 
@@ -629,7 +648,8 @@ def annotate_practical(rows: list[dict], min_effect: float | None) -> list[dict]
 
 def next_step(effects: dict, rows: list[dict], design: np.ndarray,
               factor_names: list[str], best_run_idx: int | None,
-              min_effect: float | None = None, objective: str | None = None) -> list[dict]:
+              min_effect: float | None = None, objective: str | None = None,
+              has_categorical: bool = False, no_resolution: bool = False) -> list[dict]:
     """Decide what the measurements say to do next, in priority order.
 
     Rules (sequential-experimentation practice: screen -> decouple -> confirm ->
@@ -644,6 +664,16 @@ def next_step(effects: dict, rows: list[dict], design: np.ndarray,
       stop_or_widen   nothing moved the number beyond noise or min_effect
     """
     steps: list[dict] = []
+    if no_resolution:
+        # Every run measured the same value: this objective cannot distinguish
+        # anything, so no rule below has evidence to fire on.
+        return [{
+            "action": "stop_or_widen", "terms": [], "objective": objective,
+            "reason": ("This objective did not change across any run (zero observed "
+                       "range). It has no resolution here: it can neither pick a winner "
+                       "nor certify a guardrail. Use a finer-grained measurement, or a "
+                       "wider factor range, before trusting it."),
+        }]
     sig = [r for r in rows if r.get("significant")]
     practical = [r for r in rows if r.get("practically_significant")]
 
@@ -665,11 +695,14 @@ def next_step(effects: dict, rows: list[dict], design: np.ndarray,
         why = ("the design is saturated (no error degrees of freedom)" if error_df == 0
                else "the residual is numerically zero" if effects.get("degenerate_fit")
                else f"only {error_df} error df")
+        how = (f"replicate {n} design rows (repeat their run_id in results.jsonl)"
+               if has_categorical else
+               f"add {n} center-point runs, or replicate {n} design rows (repeat "
+               f"their run_id in results.jsonl)")
         steps.append({
             "action": "add_replicates", "terms": [], "objective": objective,
             "reason": (f"{why}, so p-values cannot separate a real effect from a "
-                       f"fluke. Add {n} center-point runs, or replicate {n} design rows, "
-                       f"to obtain a pure-error estimate."),
+                       f"fluke. To obtain a pure-error estimate, {how}."),
         })
 
     has_signal = bool(sig) or bool(practical)
@@ -762,7 +795,8 @@ def predict_at(effects: dict, design: np.ndarray, row_idx: int,
 
 def confirm_objective(obj: dict, effects: dict, design: np.ndarray, best_idx: int,
                       include_interactions: bool, conf_values: list[float],
-                      replicate_counts: list[int] | None, alpha: float) -> dict:
+                      replicate_counts: list[int] | None, alpha: float,
+                      design_values=()) -> dict:
     """Jensen (2016) style confirmation of one objective at the best run.
 
     Prediction interval for the MEAN of n confirmation runs:
@@ -843,6 +877,7 @@ def confirm_objective(obj: dict, effects: dict, design: np.ndarray, best_idx: in
 
     return {
         "name": name, "role": role, "direction": direction,
+        "resolution": "none" if _no_resolution(design_values) else "ok",
         "predicted": yhat, "leverage": h,
         "n_confirmation": n, "confirmation_values": [float(v) for v in vals],
         "confirmation_mean": mean,
@@ -1070,7 +1105,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         direction = args.direction or "lower"
         best_run_idx = int(np.argmin(y)) if direction == "lower" else int(np.argmax(y))
         steps = next_step(effects, findings, matrix, factor_names, best_run_idx,
-                          min_effect=min_effect)
+                          min_effect=min_effect,
+                          has_categorical=_has_categorical(design_data),
+                          no_resolution=_no_resolution(y))
         best_factors: dict | None = None
         runs_block = design_data.get("runs")
         if isinstance(runs_block, list) and 0 <= best_run_idx < len(runs_block):
@@ -1162,11 +1199,21 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         findings = annotate_practical(findings, obj.get("min_effect"))
         y_obj = y_by_obj[obj_name]
         obj_best = int(np.argmin(y_obj)) if direction == "lower" else int(np.argmax(y_obj))
+        unresolved = _no_resolution(y_obj)
         steps_by_obj[obj_name] = next_step(eff, findings, matrix, factor_names, obj_best,
                                            min_effect=obj.get("min_effect"),
-                                           objective=obj_name)
+                                           objective=obj_name,
+                                           has_categorical=_has_categorical(design_data),
+                                           no_resolution=unresolved)
+        if unresolved:
+            eff["warnings"] = list(eff.get("warnings", [])) + [
+                f"{obj_name}: identical value in every run (zero observed range). "
+                f"This objective has no resolution in this design"
+                + (" and cannot certify the guardrail it represents."
+                   if obj.get("role") == "guardrail" else ".")]
         per_objective[obj_name] = {
             "ranked_effects": findings,
+            "resolution": "none" if unresolved else "ok",
             "min_effect": obj.get("min_effect"),
             "next_step": steps_by_obj[obj_name],
             "r2": eff["r2"],
@@ -1317,6 +1364,13 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     criteria = []
     warnings: list[str] = []
     n_conf = min(len(v) for v in conf.values()) if conf else 0
+    unresolved_guardrails: list[str] = []
+    for obj in obj_list:
+        if obj.get("role") == "guardrail" and _no_resolution(y_by_obj[obj["name"]]):
+            unresolved_guardrails.append(obj["name"])
+            warnings.append(f"{obj['name']}: guardrail measured the same value in every "
+                            f"design run. A metric with no resolution cannot certify that "
+                            f"nothing degraded; measure something finer-grained.")
     if n_conf < 3:
         warnings.append(f"Only {n_conf} confirmation run(s); Jensen (2016) recommends 5-10 "
                         f"at the optimum. Treat any verdict as provisional.")
@@ -1327,7 +1381,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
         eff = fit_effects(matrix, y_by_obj[name], include_interactions=include_interactions,
                           cell_values=cv)
         row = confirm_objective(obj, eff, matrix, best_idx, include_interactions,
-                                conf[name], rc, alpha)
+                                conf[name], rc, alpha, design_values=y_by_obj[name])
         warnings.extend(row.pop("warnings"))
         criteria.append(row)
 
@@ -1335,7 +1389,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     guardrails = [c for c in criteria if c["role"] == "guardrail"]
     primary_ok = bool(primaries) and all(c["pass"] is True for c in primaries)
     guardrails_ok = all(c["pass"] is not False for c in guardrails)
-    done = bool(primary_ok and guardrails_ok and n_conf >= 3)
+    done = bool(primary_ok and guardrails_ok and n_conf >= 3 and not unresolved_guardrails)
     if not primaries:
         warnings.append("No primary objective: nothing was required to improve, so 'done' "
                         "cannot be true.")
@@ -1343,6 +1397,8 @@ def cmd_confirm(args: argparse.Namespace) -> int:
         recommendation = "more_confirmation_runs"
     elif done:
         recommendation = "ship"
+    elif primary_ok and guardrails_ok and unresolved_guardrails:
+        recommendation = "improve_guardrail_resolution"
     else:
         recommendation = "re_plan"
 
@@ -1359,6 +1415,7 @@ def cmd_confirm(args: argparse.Namespace) -> int:
         "n_confirmation": n_conf,
         "alpha": alpha,
         "criteria": criteria,
+        "unresolved_guardrails": unresolved_guardrails,
         "warnings": warnings,
     }
     print(json.dumps(output, indent=2))

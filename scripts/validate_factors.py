@@ -97,8 +97,8 @@ class DefSite:
 class Validated:
     name: str
     current_value: float
-    adjustability: str  # "adjustable" | "not_adjustable"
-    reason: str  # "ok" | "dead_constant" | "duplicate_definition" | "mutation_failed" | "revert_failed" | "no_definition_site"
+    adjustability: str  # "adjustable" | "not_adjustable" | "not_probed"
+    reason: str  # "ok" | "dead_constant" | "duplicate_definition" | "mutation_failed" | "revert_failed" | "no_definition_site" | "categorical_level"
     evidence: str
     definition_site: dict | None = None  # {"file": ..., "line": ..., "value": ...}
     extras: dict = field(default_factory=dict)  # forwarded from input candidate
@@ -505,7 +505,26 @@ def main(argv: list[str] | None = None) -> int:
         name = c.get("name")
         if not name:
             continue
-        v = classify_candidate(name=name, current_value=float(c.get("current_value", 0.0)), root=root)
+        raw_value = c.get("current_value", 0.0)
+        try:
+            current_value = float(raw_value)
+        except (TypeError, ValueError):
+            # Categorical factor (e.g. "always" | "on_demand"): the numeric
+            # mutation probe does not apply. Report it as not probed rather
+            # than crashing, and tell the caller how to prove adjustability.
+            v = Validated(
+                name=name, current_value=raw_value,
+                adjustability="not_probed", reason="categorical_level",
+                evidence=(f"current_value {raw_value!r} is not numeric; prove adjustability "
+                          f"by applying the other declared level and diffing an observable "
+                          f"response (the probe only perturbs numbers)"),
+            )
+            for k in ("suggested_levels", "why", "confidence", "file", "line", "levels"):
+                if k in c:
+                    v.extras[k] = c[k]
+            results.append(v)
+            continue
+        v = classify_candidate(name=name, current_value=current_value, root=root)
         # Forward useful fields from suggest_factors (suggested_levels, why, needs_research, ...)
         for k in ("suggested_levels", "why", "confidence", "needs_research", "research_topic", "file", "line"):
             if k in c:
