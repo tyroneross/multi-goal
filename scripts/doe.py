@@ -606,6 +606,255 @@ def rank_findings(effects: dict, factor_names: list[str],
 
 
 # ---------------------------------------------------------------------------
+# Practical significance, next step, prediction, confirmation
+# ---------------------------------------------------------------------------
+
+NEXT_STEP_PRIORITY = {"decouple": 0, "add_replicates": 1, "confirm": 2,
+                      "extend_range": 3, "stop_or_widen": 4}
+
+
+def annotate_practical(rows: list[dict], min_effect: float | None) -> list[dict]:
+    """Add `low_to_high_change` (= 2 x coefficient, the predicted change from the
+    low to the high level) and `practically_significant` (|change| >= min_effect)
+    to every ranked row. A statistically significant effect smaller than the
+    smallest change worth shipping is still not worth shipping."""
+    for r in rows:
+        change = 2.0 * float(r["effect"])
+        r["low_to_high_change"] = change
+        r["practically_significant"] = (
+            None if min_effect is None else bool(abs(change) >= float(min_effect))
+        )
+    return rows
+
+
+def next_step(effects: dict, rows: list[dict], design: np.ndarray,
+              factor_names: list[str], best_run_idx: int | None,
+              min_effect: float | None = None, objective: str | None = None) -> list[dict]:
+    """Decide what the measurements say to do next, in priority order.
+
+    Rules (sequential-experimentation practice: screen -> decouple -> confirm ->
+    move; Montgomery 2013, AFIT STAT COE):
+      decouple        a significant effect shares its column with another term
+      add_replicates  no error df / degenerate fit / low power: p-values are not
+                      trustworthy until replicates supply an error estimate
+      confirm         something moved the number: run >=3 (5-10) confirmation
+                      runs at best_factors and check the prediction interval
+      extend_range    a significant main effect with the best run at one end of
+                      its range: the optimum may lie beyond it (steepest ascent)
+      stop_or_widen   nothing moved the number beyond noise or min_effect
+    """
+    steps: list[dict] = []
+    sig = [r for r in rows if r.get("significant")]
+    practical = [r for r in rows if r.get("practically_significant")]
+
+    aliased = [r for r in sig if r.get("aliased_with")]
+    if aliased:
+        terms = sorted({t for r in aliased for t in [r["term"], *r["aliased_with"]]})
+        steps.append({
+            "action": "decouple", "terms": terms, "objective": objective,
+            "reason": (f"{len(aliased)} significant effect(s) share a column with "
+                       f"other terms ({', '.join(terms)}): the same estimate under "
+                       f"several names. Run a fold-over, or one-factor-at-a-time "
+                       f"confirmation runs at these terms, before crediting any of them."),
+        })
+
+    error_df = int(effects.get("error_df", 0))
+    verdict = str(effects.get("inference", ""))
+    if error_df == 0 or effects.get("degenerate_fit") or verdict.startswith("low power"):
+        n = 3 if error_df == 0 else 2
+        why = ("the design is saturated (no error degrees of freedom)" if error_df == 0
+               else "the residual is numerically zero" if effects.get("degenerate_fit")
+               else f"only {error_df} error df")
+        steps.append({
+            "action": "add_replicates", "terms": [], "objective": objective,
+            "reason": (f"{why}, so p-values cannot separate a real effect from a "
+                       f"fluke. Add {n} center-point runs, or replicate {n} design rows, "
+                       f"to obtain a pure-error estimate."),
+        })
+
+    has_signal = bool(sig) or bool(practical)
+    if has_signal:
+        steps.append({
+            "action": "confirm", "terms": [], "objective": objective,
+            "reason": ("At least one effect is real. Run >=3 (5-10 per Jensen 2016) "
+                       "confirmation runs at best_factors and check that their mean "
+                       "lies inside the model's prediction interval (`doe.py confirm`)."),
+        })
+        if best_run_idx is not None:
+            for r in sig:
+                if r.get("kind") != "main":
+                    continue
+                idx = factor_names.index(r["term"])
+                level = float(design[best_run_idx, idx])
+                side = "high" if level > 0 else "low"
+                steps.append({
+                    "action": "extend_range", "terms": [r["term"]], "objective": objective,
+                    "reason": (f"{r['term']} is significant and the best run sits at its "
+                               f"{side} level; the optimum may lie beyond the tested range. "
+                               f"Move the {side} level further out (steepest ascent) in the "
+                               f"next stage."),
+                })
+    elif error_df > 0 and not effects.get("degenerate_fit"):
+        bar = (f"the practical threshold min_effect={min_effect:g}" if min_effect is not None
+               else "noise")
+        steps.append({
+            "action": "stop_or_widen", "terms": [], "objective": objective,
+            "reason": (f"No effect exceeded {bar}. Either the factors do not move this "
+                       f"number (stop and record that), or the levels were too close "
+                       f"together (widen them and re-run)."),
+        })
+
+    steps.sort(key=lambda st: NEXT_STEP_PRIORITY[st["action"]])
+    return steps
+
+
+def merge_next_steps(per_objective_steps: dict[str, list[dict]]) -> list[dict]:
+    """Merge per-objective next steps into one ordered list without duplicates.
+    `stop_or_widen` survives only when EVERY objective says so."""
+    merged: list[dict] = []
+    seen: set = set()
+    n_obj = len(per_objective_steps)
+    stops = sum(1 for steps in per_objective_steps.values()
+                if any(st["action"] == "stop_or_widen" for st in steps))
+    for name, steps in per_objective_steps.items():
+        for st in steps:
+            if st["action"] == "stop_or_widen" and stops < n_obj:
+                continue
+            key = (st["action"], tuple(st["terms"]))
+            if key in seen:
+                for m in merged:
+                    if (m["action"], tuple(m["terms"])) == key:
+                        m.setdefault("objectives", [])
+                        if name not in m["objectives"]:
+                            m["objectives"].append(name)
+                continue
+            seen.add(key)
+            entry = dict(st)
+            entry["objectives"] = [name]
+            entry.pop("objective", None)
+            merged.append(entry)
+    merged.sort(key=lambda st: NEXT_STEP_PRIORITY[st["action"]])
+    return merged
+
+
+def _beta_vector(effects: dict, labels: list) -> np.ndarray:
+    beta = [float(effects["intercept"])]
+    for lab in labels[1:]:
+        kind, key = lab
+        beta.append(float(effects["main"][key] if kind == "main"
+                          else effects["interactions"][key]))
+    return np.asarray(beta, dtype=float)
+
+
+def predict_at(effects: dict, design: np.ndarray, row_idx: int,
+               include_interactions: bool,
+               replicate_counts: list[int] | None = None) -> tuple[float, float]:
+    """Model prediction and leverage h = x (X'X)^-1 x' at design row `row_idx`.
+    Leverage uses the observation-level matrix when replicates were fitted."""
+    X, labels = _design_matrix(design, include_interactions)
+    beta = _beta_vector(effects, labels)
+    x = X[row_idx]
+    X_fit = np.repeat(X, replicate_counts, axis=0) if replicate_counts else X
+    xtx_inv = np.linalg.pinv(X_fit.T @ X_fit)
+    h = float(x @ xtx_inv @ x)
+    return float(x @ beta), h
+
+
+def confirm_objective(obj: dict, effects: dict, design: np.ndarray, best_idx: int,
+                      include_interactions: bool, conf_values: list[float],
+                      replicate_counts: list[int] | None, alpha: float) -> dict:
+    """Jensen (2016) style confirmation of one objective at the best run.
+
+    Prediction interval for the MEAN of n confirmation runs:
+        yhat +- t(1-alpha/2, df) * sqrt(s2 * (1/n + h))
+    and for EACH run: sqrt(s2 * (1 + h)). s2 and df come from the design's error
+    term when it has one; otherwise from the confirmation sample itself
+    (pi_source = confirmation_sd) - weaker, and flagged.
+    """
+    name = obj["name"]
+    direction = obj.get("direction", "lower")
+    role = obj.get("role", "primary")
+    n = len(conf_values)
+    yhat, h = predict_at(effects, design, best_idx, include_interactions, replicate_counts)
+    vals = np.asarray(conf_values, dtype=float)
+    mean = float(vals.mean()) if n else float("nan")
+    warnings: list[str] = []
+
+    error_df = int(effects.get("error_df", 0))
+    if error_df > 0 and not effects.get("degenerate_fit"):
+        s2, df, pi_source = float(effects["error_var"]), error_df, effects.get("error_source", "residual")
+    elif n >= 2:
+        s2, df, pi_source = float(vals.var(ddof=1)), n - 1, "confirmation_sd"
+        warnings.append(f"{name}: the design carries no usable error estimate; the "
+                        f"prediction interval uses the confirmation sample SD "
+                        f"({n} runs), which is weaker.")
+    else:
+        s2, df, pi_source = float("nan"), 0, "none"
+        warnings.append(f"{name}: no error estimate at all (saturated design and "
+                        f"{n} confirmation run); cannot judge agreement.")
+
+    if df > 0 and n > 0:
+        t = float(doe_stats.t_ppf(1 - alpha / 2, df))
+        hw_mean = t * math.sqrt(max(s2, 0.0) * (1.0 / n + h))
+        hw_each = t * math.sqrt(max(s2, 0.0) * (1.0 + h))
+        pi_mean = [yhat - hw_mean, yhat + hw_mean]
+        pi_each = [yhat - hw_each, yhat + hw_each]
+        mean_in_pi = bool(pi_mean[0] <= mean <= pi_mean[1])
+        all_in_pi = bool(all(pi_each[0] <= v <= pi_each[1] for v in vals))
+    else:
+        pi_mean = pi_each = [float("nan"), float("nan")]
+        mean_in_pi = all_in_pi = None
+
+    def meets(v: float, bar: float) -> bool:
+        return v >= bar if direction == "higher" else v <= bar
+
+    target = obj.get("target"); baseline = obj.get("baseline")
+    min_acceptable = obj.get("min_acceptable"); min_effect = obj.get("min_effect")
+    bar_desc, passed, why = None, None, ""
+    if role == "primary":
+        if target is not None:
+            bar_desc = f"target {float(target):g}"
+            passed = meets(mean, float(target))
+            why = f"mean {mean:.6g} {'meets' if passed else 'misses'} {bar_desc}"
+        elif baseline is not None and min_effect is not None:
+            improvement = (float(baseline) - mean) if direction == "lower" else (mean - float(baseline))
+            bar_desc = f"improve on baseline {float(baseline):g} by >= {float(min_effect):g}"
+            passed = improvement >= float(min_effect)
+            why = f"improvement {improvement:.6g} vs min_effect {float(min_effect):g}"
+        else:
+            bar_desc = "unspecified (no target, no baseline+min_effect)"
+            passed = bool(mean_in_pi) if mean_in_pi is not None else False
+            why = "no bar declared; agreement with the model is the only check"
+            warnings.append(f"{name}: primary objective has no target and no "
+                            f"baseline+min_effect, so 'done' only means the model was confirmed.")
+        if passed and mean_in_pi is False:
+            passed = False
+            why += "; but the confirmation mean lies outside the prediction interval"
+    elif role == "guardrail":
+        bar = min_acceptable if min_acceptable is not None else baseline
+        if bar is None:
+            bar_desc, passed, why = "none declared", None, "guardrail without a bar constrains nothing"
+        else:
+            bar_desc = f"{'min_acceptable' if min_acceptable is not None else 'baseline'} {float(bar):g}"
+            passed = meets(mean, float(bar))
+            why = f"mean {mean:.6g} {'holds' if passed else 'breaks'} {bar_desc}"
+    else:
+        bar_desc, passed, why = "reported only", None, "quality metric; never decides"
+
+    return {
+        "name": name, "role": role, "direction": direction,
+        "predicted": yhat, "leverage": h,
+        "n_confirmation": n, "confirmation_values": [float(v) for v in vals],
+        "confirmation_mean": mean,
+        "pi_source": pi_source, "pi_df": df, "alpha": alpha,
+        "pi_mean": pi_mean, "pi_each": pi_each,
+        "mean_in_pi": mean_in_pi, "all_in_pi": all_in_pi,
+        "bar": bar_desc, "pass": passed, "why": why,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Level mapping (-1/+1 coding ↔ user-specified levels)
 # ---------------------------------------------------------------------------
 
@@ -816,8 +1065,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                               cell_values=cell_values)
         findings = rank_findings(effects, factor_names,
                                  alias_chains=aliasing.get("alias_chains"))
+        min_effect = getattr(args, "min_effect", None)
+        findings = annotate_practical(findings, min_effect)
         direction = args.direction or "lower"
         best_run_idx = int(np.argmin(y)) if direction == "lower" else int(np.argmax(y))
+        steps = next_step(effects, findings, matrix, factor_names, best_run_idx,
+                          min_effect=min_effect)
         best_factors: dict | None = None
         runs_block = design_data.get("runs")
         if isinstance(runs_block, list) and 0 <= best_run_idx < len(runs_block):
@@ -846,6 +1099,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             "best_run": best_run_idx,
             "best_value": float(y[best_run_idx]),
             "direction": direction,
+            "min_effect": min_effect,
+            "next_step": steps,
         }
         if best_factors is not None:
             output["best_factors"] = best_factors
@@ -886,7 +1141,13 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     # Per-objective effects analysis (replicate-aware: pure error per objective)
     per_objective: dict[str, dict] = {}
+    steps_by_obj: dict[str, list[dict]] = {}
     any_replicated = False
+    contract = objectives.validate_objectives(obj_list)
+    if contract["errors"]:
+        for e in contract["errors"]:
+            sys.stderr.write(f"objectives contract error: {e}\n")
+        return 2
     for obj in obj_list:
         obj_name = obj["name"]
         direction = obj.get("direction", "lower")
@@ -898,8 +1159,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                           cell_values=cell_values)
         findings = rank_findings(eff, factor_names,
                                  alias_chains=aliasing.get("alias_chains"))
+        findings = annotate_practical(findings, obj.get("min_effect"))
+        y_obj = y_by_obj[obj_name]
+        obj_best = int(np.argmin(y_obj)) if direction == "lower" else int(np.argmax(y_obj))
+        steps_by_obj[obj_name] = next_step(eff, findings, matrix, factor_names, obj_best,
+                                           min_effect=obj.get("min_effect"),
+                                           objective=obj_name)
         per_objective[obj_name] = {
             "ranked_effects": findings,
+            "min_effect": obj.get("min_effect"),
+            "next_step": steps_by_obj[obj_name],
             "r2": eff["r2"],
             "degenerate_fit": eff.get("degenerate_fit", False),
             "intercept": eff["intercept"],
@@ -927,7 +1196,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     # Pull concrete factor levels for best run
     best_factors_multi: dict | None = None
     runs_block = design_data.get("runs")
-    if isinstance(runs_block, list) and 0 <= best_run_id < len(runs_block):
+    if (best_run_id is not None and isinstance(runs_block, list)
+            and 0 <= best_run_id < len(runs_block)):
         candidate = runs_block[best_run_id].get("_factors")
         if isinstance(candidate, dict):
             best_factors_multi = candidate
@@ -942,13 +1212,155 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             "selection": selection,
         },
         "aliasing": aliasing,
+        "objectives_contract": contract,
         "per_objective": per_objective,
         "selection": sel_result,
         "best_run": best_run_id,
+        "next_step": merge_next_steps(steps_by_obj),
     }
     if best_factors_multi is not None:
         output["best_factors"] = best_factors_multi
 
+    print(json.dumps(output, indent=2))
+    return 0
+
+
+def _read_confirmation(path: str, obj_names: list[str]) -> dict[str, list[float]]:
+    """confirm.jsonl rows: {"values": {...}} or {"value": n} (single objective)."""
+    out: dict[str, list[float]] = {n: [] for n in obj_names}
+    single = obj_names[0] if len(obj_names) == 1 else None
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if "values" in row:
+            vals = row["values"]
+        elif "value" in row and single is not None:
+            vals = {single: row["value"]}
+        else:
+            raise ValueError("confirmation row needs 'values' (or 'value' with one objective)")
+        for n in obj_names:
+            if n not in vals:
+                raise ValueError(f"confirmation row missing objective '{n}'")
+            v = float(vals[n])
+            if not math.isfinite(v):
+                raise ValueError(f"non-finite confirmation value for '{n}'")
+            out[n].append(v)
+    return out
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    """Judge whether the best run is confirmed and whether the goal contract is met."""
+    design_data = json.loads(Path(args.design).read_text())
+    matrix = np.array(design_data["matrix"], dtype=float)
+    factor_names = [f["name"] for f in design_data["factors"]]
+    n = matrix.shape[0]
+    k = matrix.shape[1]
+    include_interactions = (k <= 3)
+    alpha = float(args.alpha)
+
+    try:
+        obj_list, selection = _load_objectives_arg(getattr(args, "objectives", None),
+                                                   getattr(args, "selection", None))
+    except Exception as exc:
+        sys.stderr.write(f"--objectives parse error: {exc}\n")
+        return 2
+
+    single_metric = obj_list is None
+    if single_metric:
+        obj_list = [{"name": "value", "direction": args.direction or "lower",
+                     "role": "primary", "weight": 1.0,
+                     "target": args.target, "baseline": args.baseline,
+                     "min_effect": args.min_effect}]
+        selection = "scalarize"
+    obj_names = [o["name"] for o in obj_list]
+
+    # Re-collect the design's results and refit per objective.
+    raw_lines = Path(args.results).read_text().splitlines()
+    try:
+        if single_metric:
+            y, cell_values, _ = _collect_single_metric(raw_lines, n)
+            y_by_obj = {"value": y}
+            cellvals_by_obj = {"value": cell_values}
+            mean_rows = [{"run_id": i, "values": {"value": float(y[i])}} for i in range(n)]
+        else:
+            raw_results = []
+            for line in raw_lines:
+                line = line.strip()
+                if line:
+                    row = json.loads(line)
+                    if "value" in row and "values" not in row and len(obj_names) == 1:
+                        row = {"run_id": row["run_id"], "values": {obj_names[0]: row["value"]}}
+                    raw_results.append(row)
+            y_by_obj, cellvals_by_obj, mean_rows, _ = _collect_multi_metric(
+                raw_results, obj_names, n)
+        conf = _read_confirmation(args.confirmation, obj_names)
+    except (ValueError, KeyError) as exc:
+        sys.stderr.write(f"results parse error: {exc}\n")
+        return 2
+
+    if single_metric:
+        yv = y_by_obj["value"]
+        best_idx = int(np.argmin(yv)) if obj_list[0]["direction"] == "lower" else int(np.argmax(yv))
+    else:
+        sel = objectives.select_best([mean_rows[i] for i in range(n)], obj_list, selection)
+        best_idx = sel["best_run_id"]
+        if best_idx is None:
+            print(json.dumps({"done": False, "recommendation": "re_plan",
+                              "best_run": None, "best_factors": None,
+                              "n_confirmation": 0, "alpha": alpha, "criteria": [],
+                              "reason": sel.get("reason"),
+                              "warnings": sel.get("warnings", [])}, indent=2))
+            return 0
+
+    criteria = []
+    warnings: list[str] = []
+    n_conf = min(len(v) for v in conf.values()) if conf else 0
+    if n_conf < 3:
+        warnings.append(f"Only {n_conf} confirmation run(s); Jensen (2016) recommends 5-10 "
+                        f"at the optimum. Treat any verdict as provisional.")
+    for obj in obj_list:
+        name = obj["name"]
+        cv = cellvals_by_obj[name]
+        rc = [len(c) for c in cv] if any(len(c) > 1 for c in cv) else None
+        eff = fit_effects(matrix, y_by_obj[name], include_interactions=include_interactions,
+                          cell_values=cv)
+        row = confirm_objective(obj, eff, matrix, best_idx, include_interactions,
+                                conf[name], rc, alpha)
+        warnings.extend(row.pop("warnings"))
+        criteria.append(row)
+
+    primaries = [c for c in criteria if c["role"] == "primary"]
+    guardrails = [c for c in criteria if c["role"] == "guardrail"]
+    primary_ok = bool(primaries) and all(c["pass"] is True for c in primaries)
+    guardrails_ok = all(c["pass"] is not False for c in guardrails)
+    done = bool(primary_ok and guardrails_ok and n_conf >= 3)
+    if not primaries:
+        warnings.append("No primary objective: nothing was required to improve, so 'done' "
+                        "cannot be true.")
+    if n_conf < 3:
+        recommendation = "more_confirmation_runs"
+    elif done:
+        recommendation = "ship"
+    else:
+        recommendation = "re_plan"
+
+    best_factors = None
+    runs_block = design_data.get("runs")
+    if isinstance(runs_block, list) and 0 <= best_idx < len(runs_block):
+        best_factors = runs_block[best_idx].get("_factors")
+
+    output = {
+        "done": done,
+        "recommendation": recommendation,
+        "best_run": int(best_idx),
+        "best_factors": best_factors,
+        "n_confirmation": n_conf,
+        "alpha": alpha,
+        "criteria": criteria,
+        "warnings": warnings,
+    }
     print(json.dumps(output, indent=2))
     return 0
 
@@ -996,7 +1408,28 @@ def main(argv: list[str] | None = None) -> int:
         choices=["scalarize", "desirability", "pareto"],
         help="override selection method (default: scalarize, or from --objectives file)",
     )
+    ana.add_argument("--min-effect", type=float, default=None, dest="min_effect",
+                     help="practical-significance threshold in raw units "
+                          "(single-metric path; multi-objective reads it per objective)")
     ana.set_defaults(func=cmd_analyze)
+
+    conf = sub.add_parser("confirm", help="judge confirmation runs at the best run and "
+                                          "apply the done criteria")
+    conf.add_argument("--design", required=True)
+    conf.add_argument("--results", required=True, help="the design's results JSONL")
+    conf.add_argument("--confirmation", required=True,
+                      help='JSONL of confirmation runs at best_factors: {"values": {...}}')
+    conf.add_argument("--objectives", default=None)
+    conf.add_argument("--selection", default=None,
+                      choices=["scalarize", "desirability", "pareto"])
+    conf.add_argument("--direction", default="lower", choices=["lower", "higher"],
+                      help="single-metric path only")
+    conf.add_argument("--target", type=float, default=None, help="single-metric: absolute goal")
+    conf.add_argument("--baseline", type=float, default=None, help="single-metric: pre-experiment value")
+    conf.add_argument("--min-effect", type=float, default=None, dest="min_effect",
+                      help="single-metric: smallest change worth shipping")
+    conf.add_argument("--alpha", type=float, default=0.05)
+    conf.set_defaults(func=cmd_confirm)
 
     det = sub.add_parser("detect", help="show which design auto-selects for k factors")
     det.add_argument("factor_count")
