@@ -9,17 +9,23 @@ Run as a Claude Code / Codex plugin (the `agent-doe-engine` skill or `/agent-doe
 
 Two factors (`workers`, `batch`), two competing objectives (latency should drop, cost should not balloon).
 
-### 1. Define objectives → `.agent-doe-engine/optimize/objectives.json`
+### 1. Define the goal contract → `.agent-doe-engine/optimize/objectives.json`
+
+Measure the baseline 3 times first; `min_effect` is the smallest change worth shipping (at least 2x the noise SD).
 
 ```json
 {
   "objectives": [
-    {"name": "latency_ms", "direction": "lower", "weight": 0.7},
-    {"name": "cost_usd",   "direction": "lower", "weight": 0.3}
+    {"name": "latency_ms", "direction": "lower", "weight": 0.7, "role": "primary",
+     "driver": "request latency", "baseline": 90, "target": 50, "min_effect": 5},
+    {"name": "cost_usd",   "direction": "lower", "weight": 0.3, "role": "guardrail",
+     "baseline": 5.0}
   ],
   "selection": "scalarize"
 }
 ```
+
+`cost_usd` is a guardrail: a run costing more than the 5.0 baseline is infeasible and cannot win.
 
 ### 2. Define factors → `.agent-doe-engine/optimize/factors.json`
 
@@ -81,7 +87,21 @@ Output (abridged):
 }
 ```
 
-`workers` is the dominant latency driver; the weighted pick favors low latency (weight 0.7) at higher cost. The `pareto_front` `[1, 3]` shows the two rational trade-offs - switch `selection` to `pareto` to choose between them yourself.
+`workers` is the dominant latency driver. The output also carries `objectives_contract` (warnings about an incomplete contract), `selection.feasible_run_ids` / `infeasible` (which runs broke a guardrail), `practically_significant` per effect, and `next_step` - the ordered actions the fit supports (`decouple`, `add_replicates`, `confirm`, `extend_range`, `stop_or_widen`). The `pareto_front` `[1, 3]` shows the rational trade-offs - switch `selection` to `pareto` to choose between them yourself.
+
+### 6. Confirm, then decide
+
+When `next_step` says `confirm`, measure 3-10 runs at `best_factors` into `confirm.jsonl` (`{"values": {"latency_ms": 50.1, "cost_usd": 4.9}}` per line) and judge them:
+
+```bash
+python3 scripts/doe.py confirm \
+  --design .agent-doe-engine/optimize/doe.json \
+  --results .agent-doe-engine/optimize/results.jsonl \
+  --objectives .agent-doe-engine/optimize/objectives.json \
+  --confirmation .agent-doe-engine/optimize/confirm.jsonl
+```
+
+Output: `done` (true only when every guardrail holds, every primary clears its bar, and each primary's confirmation mean lies inside the model's prediction interval), a `criteria` row per objective saying why, and `recommendation` (`ship` / `more_confirmation_runs` / `re_plan`). Single-metric runs pass `--target`, `--baseline`, `--min-effect` instead of `--objectives`.
 
 ## Single-objective / single-factor
 

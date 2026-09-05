@@ -99,46 +99,50 @@ If the host has no research capability, skip this step silently - the heuristic 
 
 Write the validated (and optionally researched) candidates to `.agent-doe-engine/optimize/factors.json` in the shape `[{name, low, high}]` (numeric two-level) or `[{name, levels:[...]}]` (numeric multi-level OR categorical). From here, the rest of the SETUP phase (objectives, design) proceeds as Phase 1 below.
 
-## Phase 1: SETUP - get the objectives and factors right
+## Phase 1: SETUP - the goal contract
 
-Wrong metric = Goodhart's Law. Wrong factors = wasted runs. This is the highest-leverage phase.
+Wrong metric = Goodhart's Law. Wrong factors = wasted runs. This is the highest-leverage phase, and it is where "done" gets defined - before any run, not after.
 
-### 1.1 - Name the objectives
+### 1.1 - Write the goal contract
 
-Each objective is a number plus how to read it:
+Every objective is a number, a direction, and a **role** that turns it into a decision rule. Tie each primary to the product **driver** it serves; a number with no driver cannot tell you whether moving it mattered.
 
 ```json
 {
   "objectives": [
-    {"name": "latency_ms",   "direction": "lower",  "weight": 0.5, "metric_cmd": "python3 bench.py --stat p95",
-     "validity": "validated"},
-    {"name": "cost_usd",     "direction": "lower",  "weight": 0.3, "metric_cmd": "python3 cost.py",
-     "validity": "validated"},
-    {"name": "coverage_pct", "direction": "higher", "weight": 0.2, "metric_cmd": "pytest --cov | tail -1 | grep -o '[0-9]*%'",
-     "validity": "unvalidated"}
+    {"name": "feed_p50_ms", "direction": "lower", "weight": 0.6, "role": "primary",
+     "driver": "feed is the product surface: page load", "metric_cmd": "python3 bench.py --stat p50",
+     "baseline": 1630, "target": 800, "min_effect": 100, "validity": "validated"},
+    {"name": "search_accuracy", "direction": "higher", "weight": 0, "role": "guardrail",
+     "driver": "search answers the question", "metric_cmd": "npx tsx scripts/eval.ts --metric",
+     "baseline": 0.83, "min_acceptable": 0.83},
+    {"name": "db_grounding", "direction": "higher", "weight": 0, "role": "quality",
+     "metric_cmd": "..."}
   ],
-  "selection": "scalarize"
+  "selection": "desirability"
 }
 ```
 
-Write it to `.agent-doe-engine/optimize/objectives.json`. One objective is the single-metric case - everything below still works.
+| Role | Decision rule | Must carry |
+|---|---|---|
+| `primary` | must **improve** (superiority): meets `target`, or beats `baseline` by `min_effect` | `driver`, plus `target` or `min_effect` |
+| `guardrail` | must **not degrade** (non-inferiority): never worse than `min_acceptable`, else `baseline` | `min_acceptable` or `baseline` |
+| `quality` | reported, never decides | - |
 
-**`validity` field** (optional; default `unvalidated` when absent):
+Guardrails are constraints, not score terms: a run that breaks one is infeasible and cannot win however good its primaries look. `min_acceptable` / `target` are absolute limits in raw units (Derringer & Suich 1980); without them desirability is only relative to the batch, so the worst run always scores 0 even when it is acceptable. `min_effect` is the smallest change worth shipping - an effect below it is reported as real-but-not-practical.
 
-| Value | Meaning |
-|---|---|
-| `validated` | The metric has been shown to correlate with the real user outcome (e.g. correlated against ground-truth human ratings or an A/B result). A DOE winner on this metric is safe to apply. |
-| `unvalidated` | The metric is a proxy that has not yet been correlated against the real user outcome. Optimizing it moves the number; whether it moves the underlying goal is unknown. |
-| `needs_human_ratings` | Known proxy; ground-truth human ratings exist or could be collected and should be used to validate before the next DOE cycle. |
+**Measure the baseline first, at least 3 times.** Record the mean as `baseline` and set `min_effect` to at least 2x the sample SD (noise floor). `doe.py analyze` runs `validate_objectives` and refuses a contradictory contract (bar better than target); an incomplete one runs, with warnings that say what "done" cannot mean yet.
 
-Set `validity: "validated"` only when you have evidence (e.g. a correlation study, an A/B test, or a published benchmark showing the metric tracks user outcome). Leave it absent or `"unvalidated"` during early exploration. The overfitting reviewer treats any DOE or loop winner selected on an `unvalidated` or `needs_human_ratings` metric as a `strong_checkpoint` finding (Goodhart risk - see Phase 3).
+Write it to `.agent-doe-engine/optimize/objectives.json`. One primary objective is the single-metric case - everything below still works (`--min-effect`, `--target`, `--baseline` on the CLI).
+
+**`validity` field** (optional; default `unvalidated`): `validated` = the metric is known to track the user outcome (correlation study, A/B, published benchmark); `unvalidated` = a proxy; `needs_human_ratings` = a proxy with ratings available. The overfitting reviewer treats a winner selected on an unvalidated metric as a `strong_checkpoint` finding (Goodhart risk).
 
 **Choosing `selection`:**
 
-| Method | Picks | Use when |
+| Method | Picks (among feasible runs) | Use when |
 |---|---|---|
-| `scalarize` *(default)* | max weighted sum of normalized objectives | you can express priorities as weights |
-| `desirability` | max Derringer-Suich D (geometric mean of per-objective desirabilities) | every objective must clear a bar - a zero on one tanks the run |
+| `scalarize` *(default)* | max weighted sum of normalized primaries | you can express priorities as weights |
+| `desirability` | max Derringer-Suich D (geometric mean of per-primary desirabilities) | every primary must clear a bar - a zero on one tanks the run |
 | `pareto` | the non-dominated trade-off set (single winner = max-desirability point on the front) | you want to see all trade-offs before committing |
 
 ### 1.2 - Identify factors
@@ -184,6 +188,43 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/doe.py analyze \
 ```
 
 Output: ranked main effects + interactions **per objective**, the `selection` result (best run, scores, **always** the `pareto_front`), and `best_factors` (concrete winning values). Apply the winning combination as one commit. If `selection: pareto`, present the front and let the user pick the trade-off; default to the max-desirability point.
+
+## Phase 2b: READ THE NEXT STEP - the measurements decide what happens next
+
+`effects.json` carries `next_step`: an ordered list of `{action, terms, reason}` derived from the fit, not from opinion. Follow the first entry.
+
+| Action | Fires when | What to do |
+|---|---|---|
+| `decouple` | a significant effect shares its column with other terms (Res III/IV alias chain) | fold-over, or one-factor-at-a-time confirmation runs at the aliased terms; do not credit any of them yet |
+| `add_replicates` | saturated design (no error df), degenerate fit, or low power | add 3 center points or replicate 2-3 rows; p-values are not evidence until then |
+| `confirm` | at least one real effect | go to Phase 2c |
+| `extend_range` | a significant main effect with the best run at the edge of its range | the optimum may lie beyond: move that level further out in the next stage (steepest ascent) |
+| `stop_or_widen` | nothing beat noise or `min_effect` | the factors do not move the number (record that), or the levels were too close (widen and re-run) |
+
+Sequential experimentation is the method, not an option: plan the first matrix at roughly a quarter of the run budget (Montgomery), keep the rest for decoupling, moving, and confirming. Each ranked effect also carries `low_to_high_change` (2x the coefficient) and `practically_significant` (against `min_effect`).
+
+## Phase 2c: CONFIRM - the done criteria
+
+Nothing is done because a batch had a best row. Run **at least 3 (5-10 per Jensen 2016) confirmation runs at `best_factors`**, one row per run in `confirm.jsonl` as `{"values": {...}}`, then:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/doe.py confirm \
+  --design .agent-doe-engine/optimize/doe.json \
+  --results .agent-doe-engine/optimize/results.jsonl \
+  --objectives .agent-doe-engine/optimize/objectives.json \
+  --confirmation .agent-doe-engine/optimize/confirm.jsonl \
+  > .agent-doe-engine/optimize/confirm.json
+```
+
+`done` is true only when **all** of these hold, and the output says which one failed:
+
+1. every guardrail holds on the confirmation mean;
+2. every primary meets its `target`, or beats `baseline` by at least `min_effect`;
+3. the confirmation mean of every primary lies inside the model's prediction interval (`mean_in_pi`) - the design predicted this result, so it is not a fluke;
+4. at least 3 confirmation runs were measured;
+5. Phase 3's overfitting review passes.
+
+`recommendation` is `ship`, `more_confirmation_runs`, or `re_plan`. When the design has no error estimate the interval falls back to the confirmation sample SD and is flagged `pi_source: confirmation_sd` - weaker, and said so.
 
 ## Single-factor - autoresearch loop
 

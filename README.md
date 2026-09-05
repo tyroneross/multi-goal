@@ -56,8 +56,22 @@ When you care about several numbers that fight each other (faster, but cheaper, 
 | Method | What it does | Use when |
 |---|---|---|
 | **scalarize** | Picks the best weighted blend of your goals | You can rank goals by weight |
-| **desirability** | Every goal must clear a minimum bar, not just average out | No single goal can be sacrificed |
+| **desirability** | Geometric mean of per-goal desirabilities: a zero on any goal zeroes the run. With `min_acceptable`/`target` declared the bar is absolute (Derringer-Suich); without them it is relative to the batch | No single goal can be sacrificed |
 | **pareto** | Shows all the best trade-offs (the options where improving one number can only come by hurting another) | You want to see the choices before committing |
+
+## Goals, guardrails, and knowing when you are done
+
+Each objective carries a `role`. A **primary** must improve (meet `target`, or beat `baseline` by `min_effect`, the smallest change worth shipping). A **guardrail** must not degrade (never worse than `min_acceptable`, else `baseline`); it is a constraint, and a run that breaks it cannot win. A **quality** metric is reported and never decides. Every primary names the product `driver` it serves.
+
+```json
+{"objectives": [
+  {"name": "latency_ms", "direction": "lower", "role": "primary", "driver": "page load",
+   "baseline": 118, "target": 85, "min_effect": 5},
+  {"name": "accuracy", "direction": "higher", "role": "guardrail", "min_acceptable": 0.90}
+ ], "selection": "desirability"}
+```
+
+`analyze` then tells you what the numbers say to do next (`next_step`: decouple an alias chain, add replicates, confirm, extend a range, or stop), and `confirm` judges 3-10 confirmation runs at the best setting against the model's prediction interval and the contract. `done` is true only when every guardrail holds, every primary clears its bar, and the confirmation mean lands where the model said it would.
 
 ## Built for agent tuning
 
@@ -93,6 +107,9 @@ python3 scripts/doe.py generate --factors '[{"name":"workers","low":2,"high":8},
 # 3. run each row, measure every objective into results.jsonl, then:
 python3 scripts/doe.py analyze --design doe.json --results results.jsonl \
   --objectives '{"objectives":[{"name":"latency","direction":"lower","weight":0.7},{"name":"cost","direction":"lower","weight":0.3}],"selection":"scalarize"}'
+# 4. read next_step; when it says confirm, measure 3-10 runs at best_factors and judge them:
+python3 scripts/doe.py confirm --design doe.json --results results.jsonl \
+  --objectives objectives.json --confirmation confirm.jsonl
 ```
 
 Full walkthrough and the method/math: [`docs/usage.md`](docs/usage.md), [`docs/method.md`](docs/method.md).
