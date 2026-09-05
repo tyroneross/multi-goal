@@ -336,7 +336,7 @@ class TestSelectBest:
         expected_keys = {
             "method", "bounds", "scores", "best_run_id",
             "best_score", "pareto_front", "best_values", "warnings",
-            "feasible_run_ids", "infeasible",
+            "feasible_run_ids", "infeasible", "contenders",
         }
         assert expected_keys == self._result_keys(result)
 
@@ -345,7 +345,7 @@ class TestSelectBest:
         expected_keys = {
             "method", "bounds", "scores", "best_run_id",
             "best_score", "pareto_front", "best_values", "warnings",
-            "feasible_run_ids", "infeasible",
+            "feasible_run_ids", "infeasible", "contenders",
         }
         assert expected_keys == self._result_keys(result)
 
@@ -354,7 +354,7 @@ class TestSelectBest:
         expected_keys = {
             "method", "bounds", "scores", "best_run_id",
             "best_score", "pareto_front", "best_values", "warnings",
-            "feasible_run_ids", "infeasible",
+            "feasible_run_ids", "infeasible", "contenders",
         }
         assert expected_keys == self._result_keys(result)
 

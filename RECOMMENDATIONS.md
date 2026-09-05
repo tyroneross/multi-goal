@@ -107,3 +107,15 @@ Stage A is the eval harness providing the `metric_cmd` interface; Stage B (the r
 - The validator's `revert_failed` outcome is intentionally loud (RuntimeError surfaced as `reason: revert_failed` with the file path). If it ever fires in real use, the run should stop until the user has inspected the dirty file - this is the only failure mode that can leave the tree modified.
 - The worktree helper's `info` subcommand returns exit 1 when the worktree doesn't exist, so SKILL.md callers can branch (`if info; then ... else init; fi`).
 - Phase 0.4's research seam is intentionally minimal - it documents the contract and points at the existing `needs_research`/`research_topic` fields. No new plugin code; the host LLM owns the call.
+
+## Backlog from the 2026-09-05 Atomize AI dogfood (read path: feed, home, search)
+
+Full log: the run's `lane-b-dogfood-log.md` (13 defects). Fixed the same day: goal contract + guardrail feasibility, `next_step`, `confirm`, object-literal factor scanning with `--hint`/`--paths`, zero-resolution guardrails, categorical replicate advice, categorical `validate_factors`, near-tie `contenders`. Still open:
+
+1. **`worktree.py init` should stage runtime deps** (D4): detect gitignored `node_modules`, `.env*`, `.venv`, generated clients in the source checkout and link/copy them, warning when `node_modules` is shared.
+2. **Factor discovery by reachability, not spelling** (D2): take the objective and the entry points (routes) as input and rank by "is this on the awaited path of route X"; two of the three real factors were code-path choices with no named constant.
+3. **Categorical adjustability probe** (D3): substitute the other declared level and diff an observable response, instead of `not_probed`.
+4. **Nuisance variables and fixture pinning** (D5, D6): a place to declare what is held constant, and a warning when a live data source drifts under the matrix.
+5. **Guards that re-run the world** (D7): cache the guard per distinct code state instead of per sample.
+6. **Threshold proximity** (D9b): warn when a run sits within one measurement unit of a pass threshold.
+7. **`min_effect` from between-run noise** (D11): within-run replicates understate the noise a fresh run sees; recommend measuring the baseline across restarts.

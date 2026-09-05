@@ -1,0 +1,5 @@
+[console_scripts]
+agent-doe-engine-doe = doe:main
+agent-doe-engine-suggest-factors = suggest_factors:main
+agent-doe-engine-validate-factors = validate_factors:main
+agent-doe-engine-worktree = worktree:main

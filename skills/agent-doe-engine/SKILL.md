@@ -42,7 +42,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/worktree.py \
   --workdir "$TARGET_REPO" --target "<target name>" --json init
 ```
 
-Use the printed `path` as the worktree from this point on (`cd` into it before any further agent-doe-engine command). The branch is `agent-doe-engine/<slug>`; the worktree is `<repo-name>-agent-doe-engine-<slug>` alongside the repo. Re-running `init` is idempotent. At the end of Phase 3 Review run `worktree.py ... cleanup [--delete-branch]` to remove it.
+Use the printed `path` as the worktree from this point on (`cd` into it before any further agent-doe-engine command). The helper only adds the worktree: untracked runtime dependencies (`node_modules`, `.env*`, `.venv`, generated clients) are not there. Link or copy them before the first measurement, and know that a symlinked `node_modules` is shared with the primary checkout - anything that writes into it (e.g. `prisma generate`) writes there too. The branch is `agent-doe-engine/<slug>`; the worktree is `<repo-name>-agent-doe-engine-<slug>` alongside the repo. Re-running `init` is idempotent. At the end of Phase 3 Review run `worktree.py ... cleanup [--delete-branch]` to remove it.
 
 This is the default path, not an afterthought - there is no "just run in main" shortcut. The helper is stdlib-only and never reaches outside `git worktree` operations.
 
@@ -187,7 +187,11 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/doe.py analyze \
   > .agent-doe-engine/optimize/effects.json
 ```
 
-Output: ranked main effects + interactions **per objective**, the `selection` result (best run, scores, **always** the `pareto_front`), and `best_factors` (concrete winning values). Apply the winning combination as one commit. If `selection: pareto`, present the front and let the user pick the trade-off; default to the max-desirability point.
+Output: ranked main effects + interactions **per objective**, the `selection` result (best run, scores, `contenders` within 0.02 of the best, **always** the `pareto_front`), and `best_factors` (concrete winning values). If `contenders` lists more than one run, it is a tie: confirm each, do not trust the argmax. If `selection: pareto`, present the front and let the user pick the trade-off; default to the max-desirability point.
+
+**Replicates.** Repeating a `run_id` in `results.jsonl` is the replicate mechanism: each extra row is another measurement of that cell, the analysis pools them into a pure-error estimate, and p-values become trustworthy. Feed the baseline replicates back in as extra rows for the baseline cell.
+
+**The level is not the finding.** Before presenting `best_factors`, check each winning level for behavioural side effects (a dropped response field, a removed feature, a changed result set) - a type-check passes on a deleted feature. Ship the *finding* in a form that preserves behaviour (e.g. run the expensive query concurrently instead of removing it) and re-confirm it; the dogfood run on Atomize AI found a 36 ms win that deleted the topic chips.
 
 ## Phase 2b: READ THE NEXT STEP - the measurements decide what happens next
 

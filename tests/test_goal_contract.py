@@ -123,6 +123,18 @@ class FeasibilityTests(unittest.TestCase):
             self.assertEqual(res["feasible_run_ids"], [1])
             self.assertEqual(res["infeasible"], {0: ["acc"], 2: ["cost"]})
 
+    def test_near_tie_reports_contenders(self):
+        objs = [{"name": "lat", "direction": "lower", "role": "primary", "target": 50},
+                {"name": "mem", "direction": "lower", "role": "primary", "target": 10}]
+        runs = [
+            {"run_id": 0, "values": {"lat": 49, "mem": 9}},    # both saturated -> 1.0
+            {"run_id": 1, "values": {"lat": 45, "mem": 9.5}},  # also both saturated -> 1.0
+            {"run_id": 2, "values": {"lat": 90, "mem": 30}},
+        ]
+        res = objectives.select_best(runs, objs, "desirability")
+        self.assertEqual(sorted(res["contenders"]), [0, 1])
+        self.assertTrue(any("tie" in w for w in res["warnings"]))
+
     def test_select_best_with_no_feasible_run(self):
         runs = [{"run_id": 0, "values": {"lat": 1, "acc": 0.5, "cost": 1}}]
         res = objectives.select_best(runs, self.OBJS, "scalarize")

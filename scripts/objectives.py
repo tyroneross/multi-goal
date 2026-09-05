@@ -41,6 +41,8 @@ from typing import Any
 
 
 VALID_ROLES = ("primary", "guardrail", "quality")
+# Score gap below which two runs are reported as contenders rather than a winner.
+CONTENDER_TOLERANCE = 0.02
 VALID_DIRECTIONS = ("lower", "higher")
 
 
@@ -513,6 +515,7 @@ def select_best(
         "best_values": None,
         "feasible_run_ids": feasible_run_ids,
         "infeasible": infeasible,
+        "contenders": [],
         "warnings": warnings,
     }
     if not candidate_scores:
@@ -530,10 +533,27 @@ def select_best(
     best_run = next(r for r in runs if r["run_id"] == best_run_id)
     best_values = {name: float(best_run["values"][name]) for name in best_run["values"]}
 
+    # Near ties: a winner chosen by a hair (often a target that saturates one
+    # objective's desirability at 1.0) is a guess wearing a verdict. Report
+    # every candidate within CONTENDER_TOLERANCE of the best score so the
+    # caller confirms each rather than trusting the argmax.
+    contenders = sorted(
+        (s["run_id"] for s in candidate_scores
+         if best_score - s["score"] <= CONTENDER_TOLERANCE),
+        key=lambda rid: -next(s["score"] for s in candidate_scores if s["run_id"] == rid),
+    )
+    if len(contenders) > 1:
+        warnings.append(
+            f"Runs {contenders} score within {CONTENDER_TOLERANCE:g} of the best; treat "
+            f"them as a tie and confirm each before choosing. If a 'target' was met by "
+            f"several, the ranking among them is saturation, not evidence."
+        )
+
     result.update({
         "best_run_id": best_run_id,
         "best_score": best_score,
         "best_values": best_values,
+        "contenders": contenders,
     })
     return result
 
