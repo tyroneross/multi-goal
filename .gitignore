@@ -8,3 +8,24 @@ node_modules/
 .multi-goal/
 .build-loop/
 .archive/
+
+# >>> NavGator safety guard (auto-managed)
+# These files are regenerated from .env on every NavGator scan and contain
+# parsed hostnames/endpoints from your live environment. Credentials are
+# stripped by NavGator, but hostnames/project refs still leak infra identity.
+# Safe to delete this block if you want the files tracked — NavGator will
+# not re-add it while the markers below are missing.
+.navgator/architecture/components/COMP_config_*.json
+.navgator/architecture/components.full.jsonl
+.navgator/architecture/connections.full.jsonl
+.navgator/architecture/NAVSUMMARY.md
+.navgator/architecture/NAVSUMMARY_FULL.md
+.navgator/architecture/SUMMARY.md
+.navgator/architecture/SUMMARY_FULL.md
+.navgator/deep-map/
+.navgator/dirty.json
+.navgator/dirty.d/
+.navgator/dirty.lock*
+.navgator/scan.lock*
+.navgator/architecture/freshness.json.tmp*
+# <<< NavGator safety guard
