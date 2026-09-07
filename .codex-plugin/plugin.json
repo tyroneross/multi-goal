@@ -1,6 +1,6 @@
 {
   "name": "agent-doe-engine",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A design-of-experiments engine for tuning AI agents. It finds which settings actually change your results, tells you whether each change is real or just run-to-run noise, and picks the best combination when speed, cost, and quality compete. One planned batch of trials instead of guessing or testing one thing at a time.",
   "author": {
     "name": "Tyrone Ross, Jr",
