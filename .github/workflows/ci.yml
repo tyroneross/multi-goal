@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# The weekly cut reads the newest COMPLETED ci.yml run on main and treats any
+# conclusion other than `success` as red, so a cancelled main run would block
+# a release for a reason no test caused. Superseded PR runs are still
+# cancelled -- only main's own ref is exempted.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the requires-python floor in pyproject.toml -- tested here
+        # so the floor is a claim the repo actually checks, not just states.
+        # 3.12 is what publish.yml runs on.
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v6
+
+      # npm test is the entry point the release machinery calls, and it
+      # shells out to pytest -- node has to be here for that to run at all.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          package-manager-cache: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install npm metadata lock
+        run: npm ci --ignore-scripts
+
+      # -e . is what brings numpy and puts scripts/ on the import path
+      # (pyproject sets [tool.setuptools.package-dir] "" = "scripts"). pytest
+      # is not a runtime dependency, so it is named explicitly.
+      - name: Install Python dependencies
+        run: python -m pip install -e . pytest
+
+      # Deliberately `npm test`, not `pytest` directly, so CI exercises the
+      # exact command the publish workflow runs.
+      - name: Test
+        run: npm test
