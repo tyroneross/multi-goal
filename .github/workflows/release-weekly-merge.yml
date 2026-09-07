@@ -52,12 +52,16 @@ jobs:
       # action majors, the label has not.
       RELEASE_PR_LABEL: 'autorelease: pending'
       # The workflow whose conclusion on main gates the cut. "" disables the guard.
-      # This repo has no workflow that runs its tests on a push to main, so
-      # there is no main-green signal to gate on and Guard 1 is disabled.
-      # Its publish workflow runs the test suite itself before publishing,
-      # which is what actually stops a broken build reaching npm. Set this to
-      # a CI workflow filename the moment one exists.
-      CI_WORKFLOW_FILE: ""
+      # ci.yml runs this repo's pytest suite on every push to main, so its latest
+      # conclusion IS the main-green signal Guard 1 reads.
+      #
+      # This was "" until 2026-09-06, which meant the cut merged the release PR
+      # off any main, red or green. The comment that justified it pointed at the
+      # publish workflow's own test run, but publish.yml only fires on
+      # `release: published` -- downstream of this cut, so it cannot gate it.
+      # Until ci.yml landed, the only workflow running on a push to main was
+      # GitHub's Dependency Graph, which tests nothing.
+      CI_WORKFLOW_FILE: ci.yml
     steps:
       - name: Find the open release PR
         id: find
